@@ -220,6 +220,18 @@ with open("output.wav", "wb") as f:
 | Cached | **~1.2s** | Direct from cache |
 | **Improvement** | **-53%** | |
 
+### ASR (Fun-ASR-Nano) Benchmark
+
+| Audio | Language | Duration | Recognition Time | Result |
+|-------|----------|----------|------------------|--------|
+| Voice sample | Chinese | ~7s | **0.40s** | 希望你以后能够做的比我还好哟。 |
+| Voice sample | Chinese | ~7s | **0.83s** | 对，这就是我万人敬仰的太乙真人... |
+| zh.mp3 | Chinese | ~3s | **0.40s** | 开放时间早上九点至下午五点。 |
+| en.mp3 | English | ~5s | **0.70s** | The tribal chieftain called for the boy... |
+| ja.mp3 | Japanese | ~5s | **0.84s** | うちの中学は弁当制で... |
+
+> Average recognition time: **0.4-0.8s** per audio file
+
 ## 🗣️ Supported Languages
 
 ### TTS (Fun-CosyVoice3)
