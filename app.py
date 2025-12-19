@@ -148,10 +148,12 @@ class MultiPrecisionModelManager:
         load_time = time.time() - start_time
         print(f"✓ {precision} model loaded in {load_time:.2f}s")
         
-        # 共享 frontend（只需要一个）
+        # 共享 frontend（只需要一个，包含 prompt_cache）
         if self.frontend is None:
             self.frontend = model.frontend
         else:
+            # 替换新模型的 frontend 为共享的 frontend
+            # 这样所有模型共享同一个 prompt_cache
             model.frontend = self.frontend
         
         return model

@@ -271,25 +271,41 @@ class CosyVoice3(CosyVoice2):
             qwen_path,
             quantization_config=quantization_config,
             device_map="auto",
+            torch_dtype=torch.float16,  # 确保使用 float16
         )
         
-        # 3. 替换 LLM 中的 Qwen2 模块
-        self.model.llm.llm.model = qwen_model
-        
-        # 4. 加载 LLM 的其他权重（非 Qwen2 部分）
-        # 过滤掉 llm.llm.model 的权重，只加载其他部分
+        # 3. 先加载非 Qwen2 部分的权重到 LLM
         filtered_state_dict = {}
         for k, v in llm_state_dict.items():
-            if not k.startswith('llm.model.'):
-                filtered_state_dict[k] = v
+            if k.startswith('llm.model.'):
+                continue
+            filtered_state_dict[k] = v
         
         # 加载非 Qwen2 部分的权重
         missing, unexpected = self.model.llm.load_state_dict(filtered_state_dict, strict=False)
-        logging.info(f'LLM loaded with {precision} quantization. Missing keys: {len(missing)}, Unexpected: {len(unexpected)}')
+        logging.info(f'LLM non-Qwen2 weights loaded. Missing keys: {len(missing)}, Unexpected: {len(unexpected)}')
         
-        self.model.llm.to(device).eval()
+        # 4. 替换 LLM 中的 Qwen2 模块
+        self.model.llm.llm.model = qwen_model
         
-        # 5. 正常加载 flow 和 hift（保持原精度）
+        # 5. 将 LLM 的非量化部分转换为 float16 并移到设备上
+        for name, param in self.model.llm.named_parameters():
+            if 'llm.model' not in name:
+                param.data = param.data.to(device).half()
+        
+        # 将 embedding 层也转换为 float16
+        if hasattr(self.model.llm, 'speech_embedding'):
+            self.model.llm.speech_embedding = self.model.llm.speech_embedding.to(device).half()
+        if hasattr(self.model.llm, 'llm_embedding'):
+            self.model.llm.llm_embedding = self.model.llm.llm_embedding.to(device).half()
+        if hasattr(self.model.llm, 'llm_decoder'):
+            self.model.llm.llm_decoder = self.model.llm.llm_decoder.to(device).half()
+        
+        self.model.llm.eval()
+        
+        logging.info(f'LLM loaded with {precision} quantization')
+        
+        # 6. 正常加载 flow 和 hift（保持原精度）
         self.model.flow.load_state_dict(torch.load('{}/flow.pt'.format(model_dir), map_location=device), strict=True)
         self.model.flow.to(device).eval()
         
