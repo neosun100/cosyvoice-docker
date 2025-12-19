@@ -188,9 +188,19 @@ class CosyVoice2(CosyVoice):
 
 class CosyVoice3(CosyVoice2):
 
-    def __init__(self, model_dir, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1):
+    def __init__(self, model_dir, load_trt=False, load_vllm=False, fp16=False, trt_concurrent=1, precision="fp16"):
+        """
+        Args:
+            model_dir: Path to model directory
+            load_trt: Load TensorRT engine
+            load_vllm: Load vLLM engine
+            fp16: Use FP16 inference
+            trt_concurrent: TensorRT concurrent streams
+            precision: LLM precision - "fp16" (default), "int8", or "int4"
+        """
         self.model_dir = model_dir
         self.fp16 = fp16
+        self.precision = precision
         if not os.path.exists(model_dir):
             model_dir = snapshot_download(model_dir)
         hyper_yaml_path = '{}/cosyvoice3.yaml'.format(model_dir)
@@ -210,9 +220,15 @@ class CosyVoice3(CosyVoice2):
             load_trt, fp16 = False, False
             logging.warning('no cuda device, set load_trt/fp16 to False')
         self.model = CosyVoice3Model(configs['llm'], configs['flow'], configs['hift'], fp16)
-        self.model.load('{}/llm.pt'.format(model_dir),
-                        '{}/flow.pt'.format(model_dir),
-                        '{}/hift.pt'.format(model_dir))
+        
+        # 根据 precision 决定是否使用量化加载
+        if precision in ["int8", "int4"]:
+            self._load_with_quantization(model_dir, precision)
+        else:
+            self.model.load('{}/llm.pt'.format(model_dir),
+                            '{}/flow.pt'.format(model_dir),
+                            '{}/hift.pt'.format(model_dir))
+        
         if load_vllm:
             self.model.load_vllm('{}/vllm'.format(model_dir))
         if load_trt:
@@ -223,6 +239,65 @@ class CosyVoice3(CosyVoice2):
                                 trt_concurrent,
                                 self.fp16)
         del configs
+    
+    def _load_with_quantization(self, model_dir, precision):
+        """使用量化方式加载 LLM，其他模块保持原精度"""
+        from transformers import Qwen2ForCausalLM, BitsAndBytesConfig
+        
+        device = self.model.device
+        
+        # 1. 加载 LLM 权重（先加载到 CPU）
+        llm_state_dict = torch.load('{}/llm.pt'.format(model_dir), map_location='cpu')
+        
+        # 2. 加载量化的 Qwen2 模型
+        qwen_path = os.path.join(model_dir, 'CosyVoice-BlankEN')
+        logging.info(f'Loading Qwen2 with {precision} quantization from {qwen_path}')
+        
+        if precision == "int8":
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+            )
+        else:  # int4
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        
+        # 加载量化的 Qwen2
+        qwen_model = Qwen2ForCausalLM.from_pretrained(
+            qwen_path,
+            quantization_config=quantization_config,
+            device_map="auto",
+        )
+        
+        # 3. 替换 LLM 中的 Qwen2 模块
+        self.model.llm.llm.model = qwen_model
+        
+        # 4. 加载 LLM 的其他权重（非 Qwen2 部分）
+        # 过滤掉 llm.llm.model 的权重，只加载其他部分
+        filtered_state_dict = {}
+        for k, v in llm_state_dict.items():
+            if not k.startswith('llm.model.'):
+                filtered_state_dict[k] = v
+        
+        # 加载非 Qwen2 部分的权重
+        missing, unexpected = self.model.llm.load_state_dict(filtered_state_dict, strict=False)
+        logging.info(f'LLM loaded with {precision} quantization. Missing keys: {len(missing)}, Unexpected: {len(unexpected)}')
+        
+        self.model.llm.to(device).eval()
+        
+        # 5. 正常加载 flow 和 hift（保持原精度）
+        self.model.flow.load_state_dict(torch.load('{}/flow.pt'.format(model_dir), map_location=device), strict=True)
+        self.model.flow.to(device).eval()
+        
+        hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load('{}/hift.pt'.format(model_dir), map_location=device).items()}
+        self.model.hift.load_state_dict(hift_state_dict, strict=True)
+        self.model.hift.to(device).eval()
+        
+        logging.info(f'Model loaded with {precision} LLM quantization')
 
 
 def AutoModel(**kwargs):

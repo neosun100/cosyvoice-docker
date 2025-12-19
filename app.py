@@ -118,77 +118,129 @@ class VoiceManager:
 
 voice_manager = VoiceManager(VOICES_DIR)
 
-# GPU Manager - 禁用自动卸载，启动时预热
-class GPUManager:
+# Multi-Precision Model Manager
+class MultiPrecisionModelManager:
+    """管理多精度模型的加载、卸载和切换"""
+    
+    SUPPORTED_PRECISIONS = ["fp16", "int8", "int4"]
+    
     def __init__(self):
-        self.model = None
+        self.models = {}  # {precision: model}
         self.model_dir = None
+        self.current_precision = "fp16"
         self.lock = threading.Lock()
-        self.prompt_cache = {}  # 缓存 prompt 特征
+        self.frontend = None  # 共享的 frontend
         
-    def get_model(self, model_dir: str = None):
+    def _load_single_model(self, precision: str):
+        """加载单个精度的模型"""
+        if precision not in self.SUPPORTED_PRECISIONS:
+            raise ValueError(f"Unsupported precision: {precision}. Supported: {self.SUPPORTED_PRECISIONS}")
+        
+        model_dir = self.model_dir or os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
+        
+        print(f"Loading {precision} model from {model_dir}...")
+        start_time = time.time()
+        
+        # 使用修改后的 AutoModel 支持 precision 参数
+        from cosyvoice.cli.cosyvoice import CosyVoice3
+        model = CosyVoice3(model_dir=model_dir, precision=precision)
+        
+        load_time = time.time() - start_time
+        print(f"✓ {precision} model loaded in {load_time:.2f}s")
+        
+        # 共享 frontend（只需要一个）
+        if self.frontend is None:
+            self.frontend = model.frontend
+        else:
+            model.frontend = self.frontend
+        
+        return model
+    
+    def load_model(self, precision: str = "fp16"):
+        """加载指定精度的模型到 GPU"""
         with self.lock:
-            if model_dir is None:
-                model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
-            if self.model is None or self.model_dir != model_dir:
-                self._load_model(model_dir)
-            return self.model
+            if precision in self.models:
+                print(f"{precision} model already loaded")
+                return True
+            
+            try:
+                self.models[precision] = self._load_single_model(precision)
+                return True
+            except Exception as e:
+                print(f"Failed to load {precision} model: {e}")
+                return False
     
-    def _load_model(self, model_dir: str):
-        if self.model is not None:
-            self.offload()
-        print(f"Loading model from {model_dir}...")
-        self.model = AutoModel(model_dir=model_dir)
-        self.model_dir = model_dir
-        print(f"Model loaded successfully!")
-    
-    def preload(self):
-        """启动时预热模型和所有音色的 embedding"""
-        print("Preloading model...")
-        model = self.get_model()
-        print("Model preloaded!")
-        
-        # 预热所有已保存音色的 embedding
-        voices = voice_manager.list_all()
-        if voices:
-            print(f"Preloading {len(voices)} voice embeddings...")
-            for v in voices:
-                voice = voice_manager.get(v["id"])
-                if voice and os.path.exists(voice["audio_path"]):
-                    try:
-                        # 调用一次 frontend_zero_shot 触发缓存
-                        model.frontend.frontend_zero_shot(
-                            "预热", voice["text"], voice["audio_path"], 
-                            24000, ""
-                        )
-                        print(f"  ✓ Cached: {v['name']} ({v['id']})")
-                    except Exception as e:
-                        print(f"  ✗ Failed: {v['name']} - {e}")
-            print(f"Voice embeddings cached: {len(model.frontend.prompt_cache)}")
-        
-        print("Model preloaded and ready!")
-    
-    def offload(self):
-        """手动卸载模型"""
-        if self.model:
-            del self.model
-            self.model = None
-            self.model_dir = None
-            self.prompt_cache.clear()
+    def unload_model(self, precision: str):
+        """卸载指定精度的模型"""
+        with self.lock:
+            if precision not in self.models:
+                print(f"{precision} model not loaded")
+                return False
+            
+            del self.models[precision]
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            print("GPU memory released")
+            print(f"✓ {precision} model unloaded")
+            
+            # 如果卸载的是当前使用的模型，切换到其他可用模型
+            if precision == self.current_precision and self.models:
+                self.current_precision = list(self.models.keys())[0]
+                print(f"Switched to {self.current_precision}")
+            
+            return True
     
-    def get_prompt_cache(self, voice_id: str):
-        """获取缓存的 prompt 特征"""
-        return self.prompt_cache.get(voice_id)
+    def get_model(self, precision: str = None):
+        """获取指定精度的模型，如果未指定则使用当前精度"""
+        with self.lock:
+            if precision is None:
+                precision = self.current_precision
+            
+            if precision not in self.models:
+                # 自动加载
+                self.models[precision] = self._load_single_model(precision)
+            
+            return self.models[precision]
     
-    def set_prompt_cache(self, voice_id: str, cache_data: dict):
-        """缓存 prompt 特征"""
-        self.prompt_cache[voice_id] = cache_data
+    def set_current_precision(self, precision: str):
+        """设置当前使用的精度"""
+        if precision not in self.SUPPORTED_PRECISIONS:
+            raise ValueError(f"Unsupported precision: {precision}")
+        self.current_precision = precision
+    
+    def preload(self, precisions: list = None):
+        """预加载指定精度的模型"""
+        if precisions is None:
+            precisions = [os.getenv("DEFAULT_PRECISION", "fp16")]
+        
+        self.model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
+        
+        for precision in precisions:
+            self.load_model(precision)
+        
+        # 预热所有已保存音色的 embedding
+        if self.frontend:
+            voices = voice_manager.list_all()
+            if voices:
+                print(f"Preloading {len(voices)} voice embeddings...")
+                model = self.get_model()
+                for v in voices:
+                    voice = voice_manager.get(v["id"])
+                    if voice and os.path.exists(voice["audio_path"]):
+                        try:
+                            model.frontend.frontend_zero_shot(
+                                "预热", voice["text"], voice["audio_path"], 
+                                24000, ""
+                            )
+                            print(f"  ✓ Cached: {v['name']} ({v['id']})")
+                        except Exception as e:
+                            print(f"  ✗ Failed: {v['name']} - {e}")
+                print(f"Voice embeddings cached: {len(model.frontend.prompt_cache)}")
+        
+        print("Model preloaded and ready!")
     
     def status(self) -> dict:
+        """获取模型状态"""
         gpu_info = {"available": torch.cuda.is_available()}
         if torch.cuda.is_available():
             gpu_info.update({
@@ -196,14 +248,38 @@ class GPUManager:
                 "memory_used": f"{torch.cuda.memory_allocated()/1024**3:.2f} GB",
                 "memory_total": f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB",
             })
-        # 获取真实的 frontend 缓存数量
-        cache_size = len(self.model.frontend.prompt_cache) if self.model else 0
+        
+        loaded_models = list(self.models.keys())
+        cache_size = len(self.frontend.prompt_cache) if self.frontend else 0
+        
         return {
-            "model_loaded": self.model is not None,
+            "loaded_models": loaded_models,
+            "current_precision": self.current_precision,
             "model_dir": self.model_dir,
             "gpu": gpu_info,
-            "prompt_cache_size": cache_size
+            "prompt_cache_size": cache_size,
+            "supported_precisions": self.SUPPORTED_PRECISIONS,
         }
+
+# 兼容旧的 GPUManager 接口
+class GPUManager:
+    def __init__(self):
+        self.manager = MultiPrecisionModelManager()
+        
+    def get_model(self, model_dir: str = None, precision: str = None):
+        if model_dir:
+            self.manager.model_dir = model_dir
+        return self.manager.get_model(precision)
+    
+    def preload(self):
+        self.manager.preload()
+    
+    def offload(self):
+        for precision in list(self.manager.models.keys()):
+            self.manager.unload_model(precision)
+    
+    def status(self) -> dict:
+        return self.manager.status()
 
 gpu_manager = GPUManager()
 
@@ -307,11 +383,12 @@ class SpeechRequest(BaseModel):
     response_format: str = "wav"  # wav, pcm
     speed: float = 1.0
     instruct: Optional[str] = None  # 指令文本（方言、情感等）
+    precision: Optional[str] = None  # 模型精度: fp16, int8, int4
 
 @app.post("/v1/audio/speech")
 async def openai_speech(request: SpeechRequest):
     """OpenAI-compatible TTS API"""
-    model = gpu_manager.get_model()
+    model = gpu_manager.get_model(precision=request.precision)
     
     # 检查是否是自定义音色
     custom_voice = voice_manager.get(request.voice)
@@ -427,13 +504,56 @@ async def list_voices():
 
 @app.get("/v1/models")
 async def list_models():
-    """列出可用模型"""
+    """列出可用模型和精度选项"""
+    status = gpu_manager.status()
     return {
         "models": [
             {"id": "cosyvoice-v3", "name": "Fun-CosyVoice3-0.5B", "description": "最新版本，效果最好"},
-            {"id": "cosyvoice-v2", "name": "CosyVoice2-0.5B", "description": "稳定版本"},
-        ]
+        ],
+        "precisions": {
+            "supported": status.get("supported_precisions", ["fp16", "int8", "int4"]),
+            "loaded": status.get("loaded_models", []),
+            "current": status.get("current_precision", "fp16"),
+        },
+        "gpu": status.get("gpu", {}),
     }
+
+@app.post("/v1/models/load")
+async def load_model(precision: str = "fp16"):
+    """加载指定精度的模型到 GPU"""
+    if precision not in ["fp16", "int8", "int4"]:
+        raise HTTPException(400, f"Unsupported precision: {precision}. Supported: fp16, int8, int4")
+    
+    success = gpu_manager.manager.load_model(precision)
+    if success:
+        return {"status": "success", "message": f"{precision} model loaded", "models": gpu_manager.status()}
+    else:
+        raise HTTPException(500, f"Failed to load {precision} model")
+
+@app.post("/v1/models/unload")
+async def unload_model(precision: str):
+    """卸载指定精度的模型"""
+    if precision not in ["fp16", "int8", "int4"]:
+        raise HTTPException(400, f"Unsupported precision: {precision}")
+    
+    success = gpu_manager.manager.unload_model(precision)
+    if success:
+        return {"status": "success", "message": f"{precision} model unloaded", "models": gpu_manager.status()}
+    else:
+        raise HTTPException(404, f"{precision} model not loaded")
+
+@app.post("/v1/models/switch")
+async def switch_model(precision: str):
+    """切换当前使用的模型精度"""
+    if precision not in ["fp16", "int8", "int4"]:
+        raise HTTPException(400, f"Unsupported precision: {precision}")
+    
+    # 如果模型未加载，先加载
+    if precision not in gpu_manager.manager.models:
+        gpu_manager.manager.load_model(precision)
+    
+    gpu_manager.manager.set_current_precision(precision)
+    return {"status": "success", "current_precision": precision, "models": gpu_manager.status()}
 
 # ============== Legacy API ==============
 
