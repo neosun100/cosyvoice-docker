@@ -50,3 +50,8 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+
+/backup/
+/data/
+docker-compose.yml

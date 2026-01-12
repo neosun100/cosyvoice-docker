@@ -1,0 +1,32 @@
+# =============================================================================
+# CosyVoice TTS Server - vLLM Accelerated Image
+# =============================================================================
+# This Dockerfile extends the base image with vLLM support for faster inference.
+#
+# Requirements:
+#   - NVIDIA GPU with compute capability >= 7.0 (Volta or newer)
+#   - CUDA 12.x compatible driver
+#
+# Build:
+#   docker build -f Dockerfile.vllm -t cosyvoice:vllm .
+#
+# Run:
+#   docker run -d --gpus all -p 8188:8188 \
+#     -v /path/to/models:/models:ro \
+#     -e MODEL_DIR=/models/Fun-CosyVoice3-0.5B \
+#     cosyvoice:vllm
+# =============================================================================
+
+# Build from base image
+FROM cosyvoice:latest
+
+# Install vLLM with compatible transformers version
+# Using vLLM 0.11.0 (V1 engine) for best performance
+RUN pip install --no-cache-dir \
+    vllm==0.11.0 \
+    transformers==4.57.1 \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com
+
+# Enable vLLM by default in this image
+ENV ENABLE_VLLM=true

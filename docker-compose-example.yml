@@ -1,0 +1,106 @@
+# =============================================================================
+# CosyVoice TTS Service - Docker Compose Configuration
+# =============================================================================
+#
+# Quick Start:
+#   1. Download model to local directory:
+#      huggingface-cli download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+#        --local-dir /path/to/models/Fun-CosyVoice3-0.5B
+#
+#   2. Set environment variables or create .env file:
+#      MODEL_PATH=/path/to/models
+#      MODEL_NAME=Fun-CosyVoice3-0.5B
+#
+#   3. Run:
+#      docker-compose up -d
+#
+# Mount Points:
+#   /models       - TTS models (read-only)
+#   /data/output  - Generated audio files
+#   /data/voices  - Custom voice storage (voices.json + audio)
+#   /data/cache   - Cache for wetext, transformers, etc.
+#
+# =============================================================================
+
+services:
+  cosyvoice:
+    image: cosyvoice:v1.1
+    container_name: cosyvoice
+    restart: unless-stopped
+
+    # GPU Configuration (use NVIDIA_VISIBLE_DEVICES env var to select GPU)
+    runtime: nvidia
+
+    # Port Mapping
+    ports:
+      - "8004:8188"
+
+    # Volume Mounts
+    volumes:
+      # Models directory (read-only)
+      - ${MODEL_PATH:-/path/to/your/models}:/models:ro
+      # Output directory for generated audio
+      - ${OUTPUT_PATH:-./data/output}:/data/output
+      # Custom voices storage
+      - ${VOICES_PATH:-/path/to/your/voices}:/data/voices
+      # Cache directory (HuggingFace/transformers default location)
+      # - ${CACHE_PATH:-./data/cache}:/root/.cache
+
+    # Environment Variables
+    environment:
+      # Model configuration
+      - MODEL_DIR=/models/Fun-CosyVoice3-0.5B
+      # vLLM acceleration (false for base image)
+      - ENABLE_VLLM=false
+      # Directory configuration
+      - OUTPUT_DIR=/data/output
+      - VOICES_DIR=/data/voices
+      # CUDA configuration
+      - NVIDIA_VISIBLE_DEVICES=3
+      - CUDA_VISIBLE_DEVICES=0
+
+    # Startup command
+    command:
+      [
+        "conda",
+        "run",
+        "--no-capture-output",
+        "-n",
+        "cosyvoice",
+        "python",
+        "server.py",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8188",
+      ]
+
+    # Health Check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8188/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+# =============================================================================
+# Example: Multi-GPU Setup
+# =============================================================================
+# To run on multiple GPUs, create additional services:
+#
+#   cosyvoice-gpu1:
+#     extends:
+#       service: cosyvoice
+#     container_name: cosyvoice-gpu1
+#     ports:
+#       - "8189:8188"
+#     environment:
+#       - CUDA_VISIBLE_DEVICES=1
+#     deploy:
+#       resources:
+#         reservations:
+#           devices:
+#             - driver: nvidia
+#               device_ids: ["1"]
+#               capabilities: [gpu]
+# =============================================================================

@@ -1,69 +1,107 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# =============================================================================
+# CosyVoice TTS Service - Production Dockerfile
+# =============================================================================
+# Features:
+#   - Multi-stage build for optimized image size
+#   - vLLM acceleration support (runtime configurable)
+#   - Multi-model support via volume mount
+#   - No embedded model download - models mounted at runtime
+#
+# Usage:
+#   docker build -t cosyvoice:latest .
+#   docker run -d --gpus all -p 8188:8188 \
+#     -v /path/to/models:/models:ro \
+#     -e MODEL_DIR=/models/Fun-CosyVoice3-0.5B \
+#     cosyvoice:latest
+# =============================================================================
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
+# -----------------------------------------------------------------------------
+# Stage 1: Base System
+# -----------------------------------------------------------------------------
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS base
 
-# Install system dependencies
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs curl wget ffmpeg sox libsox-dev unzip build-essential \
-    && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && git lfs install
+        git \
+        curl \
+        wget \
+        unzip \
+        ffmpeg \
+        sox \
+        libsox-dev \
+        build-essential \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Install Miniforge
-RUN wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh \
+# -----------------------------------------------------------------------------
+# Stage 2: Conda Environment
+# -----------------------------------------------------------------------------
+FROM base AS conda
+
+# Install Miniforge (lightweight conda)
+RUN wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+        -O /tmp/miniforge.sh \
     && bash /tmp/miniforge.sh -b -p /opt/conda \
     && rm /tmp/miniforge.sh
+
 ENV PATH=/opt/conda/bin:$PATH
 
-# Create conda environment with pynini
+# Create Python environment with pynini (required for text normalization)
 RUN conda create -n cosyvoice python=3.10 -y \
     && conda install -n cosyvoice -c conda-forge pynini==2.1.5 -y \
     && conda clean -afy
 
-# Set conda env
-ENV CONDA_DEFAULT_ENV=cosyvoice
-ENV PATH=/opt/conda/envs/cosyvoice/bin:$PATH
-SHELL ["conda", "run", "-n", "cosyvoice", "/bin/bash", "-c"]
+# -----------------------------------------------------------------------------
+# Stage 3: Python Dependencies
+# -----------------------------------------------------------------------------
+FROM conda AS deps
+
+ENV PATH=/opt/conda/envs/cosyvoice/bin:$PATH \
+    CONDA_DEFAULT_ENV=cosyvoice
 
 WORKDIR /app
 
-# Copy requirements and install
+# Install Python dependencies
 COPY requirements.txt .
+COPY backup/ttsfrd_dependency-0.1-py3-none-any.whl backup/ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl ./
+
+# Install ttsfrd for better text normalization (optional)
+RUN pip install --no-cache-dir ttsfrd_dependency-0.1-py3-none-any.whl \
+    && pip install --no-cache-dir ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl \
+    && rm -f *.whl
+
 RUN pip install --no-cache-dir -r requirements.txt \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com \
+    && rm -rf ~/.cache/pip /tmp/*
+    
 
-# Install additional dependencies
-RUN pip install --no-cache-dir fastmcp funasr \
-    -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
+# -----------------------------------------------------------------------------
+# Stage 4: Application Runtime
+# -----------------------------------------------------------------------------
+FROM deps AS runtime
 
-# Copy application code (including third_party with Matcha-TTS)
-COPY third_party third_party/
+# Copy application code
+COPY third_party/Matcha-TTS third_party/Matcha-TTS/
 COPY cosyvoice cosyvoice/
-COPY asset asset/
-COPY app.py mcp_server.py model.py ./
+COPY server.py voice_manager.py ./
 
-# Set Python path
+# Copy and extract ttsfrd resource files for better text normalization
+COPY backup/resource.zip /tmp/resource.zip
+RUN mkdir -p /app/pretrained_models/CosyVoice-ttsfrd \
+    && unzip -q /tmp/resource.zip -d /app/pretrained_models/CosyVoice-ttsfrd/ \
+    && rm -f /tmp/resource.zip
+
+# Python path configuration (required for imports)
 ENV PYTHONPATH=/app:/app/third_party/Matcha-TTS
 
-# Download models - Fun-CosyVoice3-0.5B from HuggingFace (faster)
-ARG MODEL_NAME=Fun-CosyVoice3-0.5B
-RUN pip install --no-cache-dir huggingface_hub && \
-    python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512', local_dir='pretrained_models/${MODEL_NAME}')"
+# Create mount point directories
+RUN mkdir -p /models /data/output /data/voices /root/.cache
 
-# Create data directories
-RUN mkdir -p /data/input /data/output
-
-# Environment variables
-ENV MODEL_DIR=pretrained_models/${MODEL_NAME}
-ENV INPUT_DIR=/data/input
-ENV OUTPUT_DIR=/data/output
-ENV PORT=8188
-ENV GPU_IDLE_TIMEOUT=600
-
-EXPOSE 8188
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
-
-CMD ["conda", "run", "--no-capture-output", "-n", "cosyvoice", "python", "app.py"]
+# Set shell for runtime
+SHELL ["conda", "run", "--no-capture-output", "-n", "cosyvoice", "/bin/bash", "-c"]
