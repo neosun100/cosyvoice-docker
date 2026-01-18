@@ -720,6 +720,7 @@ HTML_TEMPLATE = '''
             </div>
             <div class="header-controls">
                 <select id="lang" onchange="setLang(this.value)"><option value="zh-CN">简体中文</option><option value="en">English</option></select>
+                <button onclick="window.open('/docs', '_blank')" title="API 文档">📄</button>
                 <button onclick="toggleTheme()">🌓</button>
             </div>
         </header>
