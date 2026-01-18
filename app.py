@@ -851,11 +851,14 @@ HTML_TEMPLATE = '''
             const btn = document.getElementById('generate-btn');
             const btnText = document.getElementById('btn-text');
 
+            // 立即重置所有状态
             btn.disabled = true; btnText.textContent = '生成中...';
             document.getElementById('progress-container').classList.remove('hidden');
             document.getElementById('stats-panel').classList.remove('hidden');
             document.getElementById('audio-container').classList.remove('show');
             document.getElementById('progress').style.width = '0%';
+            document.getElementById('progress-status').innerHTML = '<span class="dot"></span> 正在生成...';
+            document.getElementById('audio-output').src = '';
             ['ttfb', 'start', 'total', 'size'].forEach(id => {
                 document.getElementById(id + '-value').textContent = '--';
                 document.getElementById('stat-' + id).classList.remove('highlight');
