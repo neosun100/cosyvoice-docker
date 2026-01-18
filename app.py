@@ -118,131 +118,77 @@ class VoiceManager:
 
 voice_manager = VoiceManager(VOICES_DIR)
 
-# Multi-Precision Model Manager
-class MultiPrecisionModelManager:
-    """管理多精度模型的加载、卸载和切换"""
-    
-    SUPPORTED_PRECISIONS = ["fp16", "int8", "int4"]
-    
+# GPU Manager - 禁用自动卸载，启动时预热
+class GPUManager:
     def __init__(self):
-        self.models = {}  # {precision: model}
+        self.model = None
         self.model_dir = None
-        self.current_precision = "fp16"
         self.lock = threading.Lock()
-        self.frontend = None  # 共享的 frontend
+        self.prompt_cache = {}  # 缓存 prompt 特征
         
-    def _load_single_model(self, precision: str):
-        """加载单个精度的模型"""
-        if precision not in self.SUPPORTED_PRECISIONS:
-            raise ValueError(f"Unsupported precision: {precision}. Supported: {self.SUPPORTED_PRECISIONS}")
-        
-        model_dir = self.model_dir or os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
-        
-        print(f"Loading {precision} model from {model_dir}...")
-        start_time = time.time()
-        
-        # 使用修改后的 AutoModel 支持 precision 参数
-        from cosyvoice.cli.cosyvoice import CosyVoice3
-        model = CosyVoice3(model_dir=model_dir, precision=precision)
-        
-        load_time = time.time() - start_time
-        print(f"✓ {precision} model loaded in {load_time:.2f}s")
-        
-        # 共享 frontend（只需要一个，包含 prompt_cache）
-        if self.frontend is None:
-            self.frontend = model.frontend
-        else:
-            # 替换新模型的 frontend 为共享的 frontend
-            # 这样所有模型共享同一个 prompt_cache
-            model.frontend = self.frontend
-        
-        return model
-    
-    def load_model(self, precision: str = "fp16"):
-        """加载指定精度的模型到 GPU"""
+    def get_model(self, model_dir: str = None):
         with self.lock:
-            if precision in self.models:
-                print(f"{precision} model already loaded")
-                return True
-            
-            try:
-                self.models[precision] = self._load_single_model(precision)
-                return True
-            except Exception as e:
-                print(f"Failed to load {precision} model: {e}")
-                return False
+            if model_dir is None:
+                model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
+            if self.model is None or self.model_dir != model_dir:
+                self._load_model(model_dir)
+            return self.model
     
-    def unload_model(self, precision: str):
-        """卸载指定精度的模型"""
-        with self.lock:
-            if precision not in self.models:
-                print(f"{precision} model not loaded")
-                return False
-            
-            del self.models[precision]
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(f"✓ {precision} model unloaded")
-            
-            # 如果卸载的是当前使用的模型，切换到其他可用模型
-            if precision == self.current_precision and self.models:
-                self.current_precision = list(self.models.keys())[0]
-                print(f"Switched to {self.current_precision}")
-            
-            return True
+    def _load_model(self, model_dir: str):
+        if self.model is not None:
+            self.offload()
+        print(f"Loading model from {model_dir}...")
+        self.model = AutoModel(model_dir=model_dir)
+        self.model_dir = model_dir
+        print(f"Model loaded successfully!")
     
-    def get_model(self, precision: str = None):
-        """获取指定精度的模型，如果未指定则使用当前精度"""
-        with self.lock:
-            if precision is None:
-                precision = self.current_precision
-            
-            if precision not in self.models:
-                # 自动加载
-                self.models[precision] = self._load_single_model(precision)
-            
-            return self.models[precision]
-    
-    def set_current_precision(self, precision: str):
-        """设置当前使用的精度"""
-        if precision not in self.SUPPORTED_PRECISIONS:
-            raise ValueError(f"Unsupported precision: {precision}")
-        self.current_precision = precision
-    
-    def preload(self, precisions: list = None):
-        """预加载指定精度的模型"""
-        if precisions is None:
-            precisions = [os.getenv("DEFAULT_PRECISION", "fp16")]
-        
-        self.model_dir = os.getenv("MODEL_DIR", "pretrained_models/Fun-CosyVoice3-0.5B")
-        
-        for precision in precisions:
-            self.load_model(precision)
+    def preload(self):
+        """启动时预热模型和所有音色的 embedding"""
+        print("Preloading model...")
+        model = self.get_model()
+        print("Model preloaded!")
         
         # 预热所有已保存音色的 embedding
-        if self.frontend:
-            voices = voice_manager.list_all()
-            if voices:
-                print(f"Preloading {len(voices)} voice embeddings...")
-                model = self.get_model()
-                for v in voices:
-                    voice = voice_manager.get(v["id"])
-                    if voice and os.path.exists(voice["audio_path"]):
-                        try:
-                            model.frontend.frontend_zero_shot(
-                                "预热", voice["text"], voice["audio_path"], 
-                                24000, ""
-                            )
-                            print(f"  ✓ Cached: {v['name']} ({v['id']})")
-                        except Exception as e:
-                            print(f"  ✗ Failed: {v['name']} - {e}")
-                print(f"Voice embeddings cached: {len(model.frontend.prompt_cache)}")
+        voices = voice_manager.list_all()
+        if voices:
+            print(f"Preloading {len(voices)} voice embeddings...")
+            for v in voices:
+                voice = voice_manager.get(v["id"])
+                if voice and os.path.exists(voice["audio_path"]):
+                    try:
+                        # 调用一次 frontend_zero_shot 触发缓存
+                        model.frontend.frontend_zero_shot(
+                            "预热", voice["text"], voice["audio_path"], 
+                            24000, ""
+                        )
+                        print(f"  ✓ Cached: {v['name']} ({v['id']})")
+                    except Exception as e:
+                        print(f"  ✗ Failed: {v['name']} - {e}")
+            print(f"Voice embeddings cached: {len(model.frontend.prompt_cache)}")
         
         print("Model preloaded and ready!")
     
+    def offload(self):
+        """手动卸载模型"""
+        if self.model:
+            del self.model
+            self.model = None
+            self.model_dir = None
+            self.prompt_cache.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("GPU memory released")
+    
+    def get_prompt_cache(self, voice_id: str):
+        """获取缓存的 prompt 特征"""
+        return self.prompt_cache.get(voice_id)
+    
+    def set_prompt_cache(self, voice_id: str, cache_data: dict):
+        """缓存 prompt 特征"""
+        self.prompt_cache[voice_id] = cache_data
+    
     def status(self) -> dict:
-        """获取模型状态"""
         gpu_info = {"available": torch.cuda.is_available()}
         if torch.cuda.is_available():
             gpu_info.update({
@@ -250,38 +196,14 @@ class MultiPrecisionModelManager:
                 "memory_used": f"{torch.cuda.memory_allocated()/1024**3:.2f} GB",
                 "memory_total": f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.2f} GB",
             })
-        
-        loaded_models = list(self.models.keys())
-        cache_size = len(self.frontend.prompt_cache) if self.frontend else 0
-        
+        # 获取真实的 frontend 缓存数量
+        cache_size = len(self.model.frontend.prompt_cache) if self.model else 0
         return {
-            "loaded_models": loaded_models,
-            "current_precision": self.current_precision,
+            "model_loaded": self.model is not None,
             "model_dir": self.model_dir,
             "gpu": gpu_info,
-            "prompt_cache_size": cache_size,
-            "supported_precisions": self.SUPPORTED_PRECISIONS,
+            "prompt_cache_size": cache_size
         }
-
-# 兼容旧的 GPUManager 接口
-class GPUManager:
-    def __init__(self):
-        self.manager = MultiPrecisionModelManager()
-        
-    def get_model(self, model_dir: str = None, precision: str = None):
-        if model_dir:
-            self.manager.model_dir = model_dir
-        return self.manager.get_model(precision)
-    
-    def preload(self):
-        self.manager.preload()
-    
-    def offload(self):
-        for precision in list(self.manager.models.keys()):
-            self.manager.unload_model(precision)
-    
-    def status(self) -> dict:
-        return self.manager.status()
 
 gpu_manager = GPUManager()
 
@@ -385,12 +307,11 @@ class SpeechRequest(BaseModel):
     response_format: str = "wav"  # wav, pcm
     speed: float = 1.0
     instruct: Optional[str] = None  # 指令文本（方言、情感等）
-    precision: Optional[str] = None  # 模型精度: fp16, int8, int4
 
 @app.post("/v1/audio/speech")
 async def openai_speech(request: SpeechRequest):
     """OpenAI-compatible TTS API"""
-    model = gpu_manager.get_model(precision=request.precision)
+    model = gpu_manager.get_model()
     
     # 检查是否是自定义音色
     custom_voice = voice_manager.get(request.voice)
@@ -507,56 +428,13 @@ async def list_voices():
 
 @app.get("/v1/models")
 async def list_models():
-    """列出可用模型和精度选项"""
-    status = gpu_manager.status()
+    """列出可用模型"""
     return {
         "models": [
             {"id": "cosyvoice-v3", "name": "Fun-CosyVoice3-0.5B", "description": "最新版本，效果最好"},
-        ],
-        "precisions": {
-            "supported": status.get("supported_precisions", ["fp16", "int8", "int4"]),
-            "loaded": status.get("loaded_models", []),
-            "current": status.get("current_precision", "fp16"),
-        },
-        "gpu": status.get("gpu", {}),
+            {"id": "cosyvoice-v2", "name": "CosyVoice2-0.5B", "description": "稳定版本"},
+        ]
     }
-
-@app.post("/v1/models/load")
-async def load_model(precision: str = "fp16"):
-    """加载指定精度的模型到 GPU"""
-    if precision not in ["fp16", "int8", "int4"]:
-        raise HTTPException(400, f"Unsupported precision: {precision}. Supported: fp16, int8, int4")
-    
-    success = gpu_manager.manager.load_model(precision)
-    if success:
-        return {"status": "success", "message": f"{precision} model loaded", "models": gpu_manager.status()}
-    else:
-        raise HTTPException(500, f"Failed to load {precision} model")
-
-@app.post("/v1/models/unload")
-async def unload_model(precision: str):
-    """卸载指定精度的模型"""
-    if precision not in ["fp16", "int8", "int4"]:
-        raise HTTPException(400, f"Unsupported precision: {precision}")
-    
-    success = gpu_manager.manager.unload_model(precision)
-    if success:
-        return {"status": "success", "message": f"{precision} model unloaded", "models": gpu_manager.status()}
-    else:
-        raise HTTPException(404, f"{precision} model not loaded")
-
-@app.post("/v1/models/switch")
-async def switch_model(precision: str):
-    """切换当前使用的模型精度"""
-    if precision not in ["fp16", "int8", "int4"]:
-        raise HTTPException(400, f"Unsupported precision: {precision}")
-    
-    # 如果模型未加载，先加载
-    if precision not in gpu_manager.manager.models:
-        gpu_manager.manager.load_model(precision)
-    
-    gpu_manager.manager.set_current_precision(precision)
-    return {"status": "success", "current_precision": precision, "models": gpu_manager.status()}
 
 # ============== Legacy API ==============
 
@@ -731,503 +609,366 @@ async def download(filename: str):
 async def ui():
     return HTML_TEMPLATE
 
-HTML_TEMPLATE = '''<!DOCTYPE html>
+
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CosyVoice - Text to Speech</title>
+    <title>CosyVoice TTS</title>
     <style>
         :root {
-            --bg: #1a1a2e; --card: #16213e; --primary: #0f3460; --accent: #e94560;
-            --text: #eee; --text-muted: #aaa; --border: #0f3460; --danger: #c0392b;
-        }
-        [data-theme="light"] {
-            --bg: #f5f5f5; --card: #fff; --primary: #e3f2fd; --accent: #1976d2;
-            --text: #333; --text-muted: #666; --border: #ddd; --danger: #e74c3c;
+            --bg: #0a0a0f; --card: #12121a; --card-hover: #1a1a25;
+            --primary: #6366f1; --primary-glow: rgba(99,102,241,0.3);
+            --accent: #22d3ee; --accent-glow: rgba(34,211,238,0.2);
+            --success: #10b981; --warning: #f59e0b; --danger: #ef4444;
+            --text: #f1f5f9; --text-muted: #94a3b8; --border: #1e293b;
+            --gradient: linear-gradient(135deg, #6366f1, #22d3ee);
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        h1 { font-size: 1.8em; background: linear-gradient(135deg, var(--accent), #ff6b6b); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .controls { display: flex; gap: 10px; }
-        select, button { padding: 8px 16px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--text); cursor: pointer; }
-        button:hover { background: var(--accent); color: white; }
-        .card { background: var(--card); border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid var(--border); }
-        .card h3 { margin-bottom: 15px; color: var(--accent); }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 0.9em; }
-        textarea, input[type="text"], input[type="number"] { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font-size: 1em; resize: vertical; }
-        textarea { min-height: 100px; }
-        .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
-        .btn-primary { background: var(--accent); color: white; border: none; padding: 14px 28px; font-size: 1.1em; width: 100%; }
-        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
-        audio { width: 100%; margin-top: 15px; }
-        .status { padding: 10px; border-radius: 6px; background: var(--primary); margin-top: 10px; }
-        .gpu-status { display: flex; justify-content: space-between; align-items: center; }
-        .upload-area { border: 2px dashed var(--border); border-radius: 8px; padding: 20px; text-align: center; cursor: pointer; transition: all 0.3s; }
-        .upload-area:hover { border-color: var(--accent); }
-        .upload-area.dragover { background: var(--primary); }
-        .hidden { display: none; }
-        .tabs { display: flex; gap: 5px; margin-bottom: 15px; }
-        .tab { padding: 10px 20px; border-radius: 6px 6px 0 0; cursor: pointer; background: var(--bg); }
-        .tab.active { background: var(--accent); color: white; }
-        .progress-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-top: 10px; }
-        .progress-bar-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.3s; }
-        @media (max-width: 600px) { .row { grid-template-columns: 1fr; } }
+        body { 
+            font-family: 'Inter', -apple-system, sans-serif; 
+            background: var(--bg); color: var(--text); min-height: 100vh;
+            background-image: radial-gradient(ellipse at top, rgba(99,102,241,0.1) 0%, transparent 50%),
+                              radial-gradient(ellipse at bottom right, rgba(34,211,238,0.05) 0%, transparent 50%);
+        }
+        .container { max-width: 1000px; margin: 0 auto; padding: 30px 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+        .logo { display: flex; align-items: center; gap: 12px; }
+        .logo-icon { width: 48px; height: 48px; border-radius: 12px; background: var(--gradient); display: flex; align-items: center; justify-content: center; font-size: 24px; box-shadow: 0 4px 20px var(--primary-glow); }
+        .logo h1 { font-size: 1.5em; font-weight: 700; background: var(--gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .logo span { font-size: 0.75em; color: var(--text-muted); }
+        .header-controls { display: flex; gap: 8px; }
+        .header-controls select, .header-controls button { padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--text); cursor: pointer; }
+        .card { background: var(--card); border-radius: 16px; padding: 24px; margin-bottom: 20px; border: 1px solid var(--border); position: relative; overflow: hidden; }
+        .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, var(--primary), transparent); opacity: 0; transition: opacity 0.3s; }
+        .card:hover::before { opacity: 1; }
+        .card-title { font-size: 0.85em; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+        .card-title::before { content: ''; width: 3px; height: 14px; background: var(--gradient); border-radius: 2px; }
+        textarea, input[type="text"], input[type="number"], select { width: 100%; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); font-size: 1em; outline: none; }
+        textarea { min-height: 120px; resize: vertical; line-height: 1.6; }
+        textarea:focus, input:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-glow); }
+        label { display: block; margin-bottom: 8px; color: var(--text-muted); font-size: 0.9em; font-weight: 500; }
+        .form-group { margin-bottom: 18px; }
+        .tabs { display: flex; gap: 6px; margin-bottom: 20px; background: var(--bg); padding: 4px; border-radius: 10px; }
+        .tab { flex: 1; padding: 12px 16px; border-radius: 8px; cursor: pointer; text-align: center; font-size: 0.9em; font-weight: 500; color: var(--text-muted); border: none; background: transparent; }
+        .tab:hover { color: var(--text); }
+        .tab.active { background: var(--primary); color: white; box-shadow: 0 2px 10px var(--primary-glow); }
+        .voice-row { display: flex; gap: 10px; align-items: center; }
+        .voice-row select { flex: 1; }
+        .icon-btn { width: 42px; height: 42px; border-radius: 10px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-size: 1.1em; display: flex; align-items: center; justify-content: center; }
+        .icon-btn:hover { border-color: var(--primary); }
+        .icon-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+        .upload-area { border: 2px dashed var(--border); border-radius: 12px; padding: 30px; text-align: center; cursor: pointer; }
+        .upload-area:hover, .upload-area.dragover { border-color: var(--primary); background: rgba(99,102,241,0.05); }
+        .upload-icon { font-size: 2.5em; margin-bottom: 10px; }
+        .upload-text { color: var(--text-muted); }
+        .upload-file { color: var(--accent); margin-top: 10px; font-weight: 500; }
+        .btn-generate { width: 100%; padding: 16px 32px; border: none; border-radius: 12px; background: var(--gradient); color: white; font-size: 1.1em; font-weight: 600; cursor: pointer; box-shadow: 0 4px 20px var(--primary-glow); }
+        .btn-generate:hover { transform: translateY(-2px); box-shadow: 0 6px 30px var(--primary-glow); }
+        .btn-generate:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .stats-panel { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 20px; padding: 16px; background: var(--bg); border-radius: 12px; }
+        .stat-item { text-align: center; padding: 16px 12px; background: var(--card); border-radius: 10px; border: 1px solid var(--border); transition: all 0.3s; }
+        .stat-item.highlight { border-color: var(--accent); box-shadow: 0 0 20px var(--accent-glow); }
+        .stat-label { font-size: 0.75em; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+        .stat-value { font-size: 1.4em; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+        .stat-value.primary { color: var(--primary); }
+        .stat-value.accent { color: var(--accent); }
+        .stat-value.success { color: var(--success); }
+        .stat-value.warning { color: var(--warning); }
+        .progress-container { margin-top: 16px; }
+        .progress-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+        .progress-fill { height: 100%; background: var(--gradient); width: 0%; transition: width 0.3s; }
+        .progress-text { margin-top: 10px; text-align: center; font-size: 0.9em; color: var(--text-muted); display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .progress-text .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); animation: pulse 1s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .audio-container { margin-top: 20px; display: none; }
+        .audio-container.show { display: block; }
+        .audio-player { width: 100%; padding: 20px; background: var(--bg); border-radius: 12px; border: 1px solid var(--border); }
+        .audio-player audio { width: 100%; height: 48px; }
+        .audio-actions { display: flex; gap: 10px; margin-top: 12px; }
+        .btn-download { flex: 1; padding: 12px 20px; border: 1px solid var(--accent); border-radius: 10px; background: transparent; color: var(--accent); font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; }
+        .btn-download:hover { background: var(--accent); color: var(--bg); }
+        .gpu-bar { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; background: var(--bg); border-radius: 10px; border: 1px solid var(--border); }
+        .gpu-info { display: flex; align-items: center; gap: 10px; font-size: 0.9em; }
+        .gpu-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); }
+        .btn-release { padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text-muted); font-size: 0.85em; cursor: pointer; }
+        .btn-release:hover { border-color: var(--warning); color: var(--warning); }
+        .checkbox-label { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 0.9em; }
+        .checkbox-label input { width: 18px; height: 18px; accent-color: var(--primary); }
+        .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+        .hidden { display: none !important; }
+        @media (max-width: 640px) { .stats-panel { grid-template-columns: repeat(2, 1fr); } .row { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🎙️ CosyVoice</h1>
-            <div class="controls">
-                <select id="lang" onchange="setLang(this.value)">
-                    <option value="zh-CN">简体中文</option>
-                    <option value="en">English</option>
-                    <option value="zh-TW">繁體中文</option>
-                    <option value="ja">日本語</option>
-                </select>
+            <div class="logo">
+                <div class="logo-icon">🎙️</div>
+                <div><h1>CosyVoice</h1><span>AI Text-to-Speech</span></div>
+            </div>
+            <div class="header-controls">
+                <select id="lang" onchange="setLang(this.value)"><option value="zh-CN">简体中文</option><option value="en">English</option></select>
                 <button onclick="toggleTheme()">🌓</button>
             </div>
         </header>
-
         <div class="card">
-            <h3 data-i18n="input">输入文本</h3>
-            <div class="form-group">
-                <textarea id="text" placeholder="请输入要合成的文本..." data-i18n-placeholder="textPlaceholder">收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐。</textarea>
-            </div>
+            <div class="card-title">输入文本</div>
+            <textarea id="text" placeholder="请输入要合成的文本...">收到好友从远方寄来的生日礼物，那份意外的惊喜与深深的祝福让我心中充满了甜蜜的快乐。</textarea>
         </div>
-
         <div class="card">
-            <h3 data-i18n="mode">合成模式</h3>
+            <div class="card-title">合成模式</div>
             <div class="tabs">
-                <div class="tab active" data-mode="zero_shot" data-i18n="zeroShot">零样本克隆</div>
-                <div class="tab" data-mode="cross_lingual" data-i18n="crossLingual">跨语种</div>
-                <div class="tab" data-mode="instruct" data-i18n="instruct">指令控制</div>
+                <button class="tab active" data-mode="zero_shot">零样本克隆</button>
+                <button class="tab" data-mode="cross_lingual">跨语种</button>
+                <button class="tab" data-mode="instruct">指令控制</button>
             </div>
-
             <div id="prompt-section">
-                <!-- 音色选择 -->
                 <div class="form-group">
-                    <label data-i18n="voiceSelect">选择音色</label>
-                    <div style="display: flex; gap: 10px; align-items: center;">
-                        <select id="voice-select" style="flex: 1;" onchange="onVoiceSelect()">
-                            <option value="">-- 上传新音频 --</option>
-                        </select>
-                        <button onclick="refreshVoices()" title="刷新列表" style="padding: 8px 12px;">🔄</button>
-                        <button onclick="deleteSelectedVoice()" title="删除选中音色" style="padding: 8px 12px; background: var(--danger, #c0392b);">🗑️</button>
+                    <label>选择音色</label>
+                    <div class="voice-row">
+                        <select id="voice-select" onchange="onVoiceSelect()"><option value="">-- 上传新音频 --</option></select>
+                        <button class="icon-btn" onclick="refreshVoices()" title="刷新">🔄</button>
+                        <button class="icon-btn danger" onclick="deleteSelectedVoice()" title="删除">🗑️</button>
                     </div>
                 </div>
-                
-                <!-- 上传新音频区域 -->
                 <div id="upload-section">
                     <div class="form-group">
-                        <label data-i18n="promptAudio">参考音频 (3-30秒)</label>
+                        <label>参考音频 (3-30秒)</label>
                         <div class="upload-area" id="upload-area">
                             <input type="file" id="prompt-file" accept="audio/*" class="hidden">
-                            <p data-i18n="uploadHint">点击或拖拽上传音频文件</p>
-                            <p id="file-name" style="color: var(--accent); margin-top: 10px;"></p>
+                            <div class="upload-icon">📁</div>
+                            <div class="upload-text">点击或拖拽上传音频文件</div>
+                            <div class="upload-file" id="file-name"></div>
                         </div>
                     </div>
-                    <div class="form-group">
-                        <label data-i18n="voiceName">音色名称 (可选，用于保存)</label>
-                        <input type="text" id="voice-name" placeholder="如：张三的声音">
+                    <div class="row">
+                        <div class="form-group"><label>音色名称</label><input type="text" id="voice-name" placeholder="如：张三的声音"></div>
+                        <div class="form-group" id="prompt-text-group"><label>参考文本 (留空自动识别)</label><input type="text" id="prompt-text" placeholder="留空将使用 ASR 自动识别"></div>
                     </div>
-                    <div class="form-group" id="prompt-text-group">
-                        <label data-i18n="promptText">参考文本 (留空则自动识别)</label>
-                        <input type="text" id="prompt-text" placeholder="留空将使用 Fun-ASR 自动识别">
-                    </div>
-                    <div class="form-group">
-                        <label style="display: flex; align-items: center; gap: 10px;">
-                            <input type="checkbox" id="save-voice" checked> <span data-i18n="saveVoice">保存为自定义音色</span>
-                        </label>
-                    </div>
+                    <label class="checkbox-label"><input type="checkbox" id="save-voice" checked><span>保存为自定义音色</span></label>
                 </div>
             </div>
-
             <div id="instruct-section" class="hidden">
-                <div class="form-group">
-                    <label data-i18n="instructText">指令文本</label>
-                    <input type="text" id="instruct-text" placeholder="用四川话说这句话">
-                </div>
+                <div class="form-group"><label>指令文本</label><input type="text" id="instruct-text" placeholder="用四川话说这句话"></div>
             </div>
-
-            <div class="row">
-                <div class="form-group">
-                    <label data-i18n="speed">语速 (0.5-2.0)</label>
-                    <input type="number" id="speed" value="1.0" min="0.5" max="2.0" step="0.1">
+            <div class="row" style="margin-top: 16px;">
+                <div class="form-group" style="margin-bottom: 0;"><label>语速</label><input type="number" id="speed" value="1.0" min="0.5" max="2.0" step="0.1"></div>
+                <div class="form-group" style="margin-bottom: 0; display: flex; align-items: flex-end;">
+                    <label class="checkbox-label" style="margin-bottom: 0; padding: 14px 0;"><input type="checkbox" id="stream-mode" checked><span>流式输出 (低延迟)</span></label>
                 </div>
             </div>
         </div>
-
         <div class="card">
-            <div class="row" style="align-items: center;">
-                <div class="form-group" style="margin-bottom: 0;">
-                    <label style="display: flex; align-items: center; gap: 10px;">
-                        <input type="checkbox" id="stream-mode" checked> <span data-i18n="streamMode">流式输出 (低延迟)</span>
-                    </label>
+            <button class="btn-generate" id="generate-btn" onclick="generate()"><span id="btn-text">🚀 生成语音</span></button>
+            <div class="progress-container hidden" id="progress-container">
+                <div class="progress-bar"><div class="progress-fill" id="progress"></div></div>
+                <div class="progress-text"><span class="dot"></span><span id="progress-status">正在生成...</span></div>
+            </div>
+            <div class="stats-panel hidden" id="stats-panel">
+                <div class="stat-item" id="stat-ttfb"><div class="stat-label">首字节延迟</div><div class="stat-value primary" id="ttfb-value">--</div></div>
+                <div class="stat-item" id="stat-start"><div class="stat-label">开始播放</div><div class="stat-value accent" id="start-value">--</div></div>
+                <div class="stat-item" id="stat-total"><div class="stat-label">总时间</div><div class="stat-value success" id="total-value">--</div></div>
+                <div class="stat-item" id="stat-size"><div class="stat-label">数据大小</div><div class="stat-value warning" id="size-value">--</div></div>
+            </div>
+            <div class="audio-container" id="audio-container">
+                <div class="audio-player">
+                    <audio id="audio-output" controls></audio>
+                    <div class="audio-actions"><button class="btn-download" id="download-btn">📥 下载音频</button></div>
                 </div>
             </div>
-            <button class="btn-primary" id="generate-btn" onclick="generate()" data-i18n="generate" style="margin-top: 15px;">生成语音</button>
-            <div class="progress-bar"><div class="progress-bar-fill" id="progress"></div></div>
-            <div id="timer" class="status hidden" style="text-align: center; font-size: 1.1em;"></div>
-            <audio id="audio-output" controls class="hidden"></audio>
-            <button id="download-btn" class="hidden" style="margin-top: 10px; padding: 10px 20px; background: var(--accent); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 1em;">
-                📥 <span data-i18n="download">下载音频</span>
-            </button>
         </div>
-
         <div class="card">
-            <div class="gpu-status">
-                <span id="gpu-info" data-i18n="gpuStatus">GPU 状态: 加载中...</span>
-                <button onclick="offloadGPU()" data-i18n="releaseGPU">释放显存</button>
+            <div class="gpu-bar">
+                <div class="gpu-info"><span class="gpu-dot"></span><span id="gpu-info">GPU: 加载中...</span></div>
+                <button class="btn-release" onclick="offloadGPU()">释放显存</button>
             </div>
         </div>
     </div>
-
     <script>
-        const i18n = {
-            'zh-CN': { input: '输入文本', mode: '合成模式', zeroShot: '零样本克隆', crossLingual: '跨语种', instruct: '指令控制', promptAudio: '参考音频 (3-30秒)', promptText: '参考文本 (留空自动识别)', instructText: '指令文本', speed: '语速', generate: '生成语音', gpuStatus: 'GPU 状态', releaseGPU: '释放显存', uploadHint: '点击或拖拽上传音频', textPlaceholder: '请输入要合成的文本...', streamMode: '流式输出 (低延迟)', generating: '生成中', completed: '完成', firstChunk: '首包', totalTime: '总耗时', audioDuration: '音频', voiceSelect: '选择音色', voiceName: '音色名称', saveVoice: '保存为自定义音色', newUpload: '-- 上传新音频 --', download: '下载音频' },
-            'en': { input: 'Input Text', mode: 'Synthesis Mode', zeroShot: 'Zero-shot Clone', crossLingual: 'Cross-lingual', instruct: 'Instruct', promptAudio: 'Reference Audio (3-30s)', promptText: 'Reference Text (auto if empty)', instructText: 'Instruction', speed: 'Speed', generate: 'Generate', gpuStatus: 'GPU Status', releaseGPU: 'Release GPU', uploadHint: 'Click or drag to upload', textPlaceholder: 'Enter text to synthesize...', streamMode: 'Streaming (Low Latency)', generating: 'Generating', completed: 'Completed', firstChunk: 'TTFB', totalTime: 'Total', audioDuration: 'Audio', voiceSelect: 'Select Voice', voiceName: 'Voice Name', saveVoice: 'Save as custom voice', newUpload: '-- Upload new audio --', download: 'Download' },
-            'zh-TW': { input: '輸入文本', mode: '合成模式', zeroShot: '零樣本克隆', crossLingual: '跨語種', instruct: '指令控制', promptAudio: '參考音頻', promptText: '參考文本', instructText: '指令文本', speed: '語速', generate: '生成語音', gpuStatus: 'GPU 狀態', releaseGPU: '釋放顯存', uploadHint: '點擊或拖拽上傳', textPlaceholder: '請輸入要合成的文本...', streamMode: '流式輸出 (低延遲)', generating: '生成中', completed: '完成', firstChunk: '首包', totalTime: '總耗時', audioDuration: '音頻', voiceSelect: '選擇音色', voiceName: '音色名稱', saveVoice: '保存為自定義音色', newUpload: '-- 上傳新音頻 --', download: '下載音頻' },
-            'ja': { input: '入力テキスト', mode: '合成モード', zeroShot: 'ゼロショット', crossLingual: '多言語', instruct: '指示制御', promptAudio: '参照音声', promptText: '参照テキスト', instructText: '指示テキスト', speed: '速度', generate: '生成', gpuStatus: 'GPU状態', releaseGPU: 'GPU解放', uploadHint: 'クリックまたはドラッグ', textPlaceholder: 'テキストを入力...', streamMode: 'ストリーミング', generating: '生成中', completed: '完了', firstChunk: '初回', totalTime: '合計', audioDuration: '音声', voiceSelect: '音声選択', voiceName: '音声名', saveVoice: 'カスタム音声として保存', newUpload: '-- 新規アップロード --', download: 'ダウンロード' }
-        };
         let currentLang = 'zh-CN', currentMode = 'zero_shot', promptFile = null, selectedVoiceId = null;
+        let startTime = 0;
 
-        function setLang(lang) {
-            currentLang = lang;
-            document.querySelectorAll('[data-i18n]').forEach(el => {
-                const key = el.dataset.i18n;
-                if (i18n[lang][key]) el.textContent = i18n[lang][key];
+        function setLang(lang) { currentLang = lang; refreshVoices(); }
+        function toggleTheme() { document.body.dataset.theme = document.body.dataset.theme === 'light' ? '' : 'light'; }
+
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                tab.classList.add('active');
+                currentMode = tab.dataset.mode;
+                document.getElementById('instruct-section').classList.toggle('hidden', currentMode !== 'instruct');
+                document.getElementById('prompt-text-group').classList.toggle('hidden', currentMode === 'cross_lingual');
             });
-            document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-                const key = el.dataset.i18nPlaceholder;
-                if (i18n[lang][key]) el.placeholder = i18n[lang][key];
-            });
-            refreshVoices();
-        }
+        });
 
-        function toggleTheme() {
-            document.body.dataset.theme = document.body.dataset.theme === 'light' ? '' : 'light';
-        }
-
-        // Voice management
         async function refreshVoices() {
             try {
                 const res = await fetch('/v1/voices/custom');
                 const data = await res.json();
                 const select = document.getElementById('voice-select');
-                const t = i18n[currentLang];
-                select.innerHTML = `<option value="">${t.newUpload}</option>` + 
-                    data.voices.map(v => `<option value="${v.id}" data-text="${v.text}">${v.name} (${v.id})</option>`).join('');
-                if (selectedVoiceId) select.value = selectedVoiceId;
-                onVoiceSelect();
-            } catch (e) { console.error('Failed to load voices:', e); }
-        }
-        
-        function onVoiceSelect() {
-            const select = document.getElementById('voice-select');
-            selectedVoiceId = select.value;
-            const uploadSection = document.getElementById('upload-section');
-            uploadSection.classList.toggle('hidden', !!selectedVoiceId);
-            
-            // 如果选择了已有音色，填充 prompt_text
-            if (selectedVoiceId) {
-                const option = select.options[select.selectedIndex];
-                document.getElementById('prompt-text').value = option.dataset.text || '';
-            }
-        }
-        
-        async function deleteSelectedVoice() {
-            if (!selectedVoiceId) { alert('请先选择要删除的音色'); return; }
-            if (!confirm('确定删除此音色？')) return;
-            try {
-                await fetch(`/v1/voices/${selectedVoiceId}`, { method: 'DELETE' });
-                selectedVoiceId = null;
-                refreshVoices();
-            } catch (e) { alert('删除失败: ' + e.message); }
+                select.innerHTML = '<option value="">-- 上传新音频 --</option>';
+                data.voices.forEach(v => { select.innerHTML += `<option value="${v.id}">${v.name}</option>`; });
+            } catch (e) { console.error(e); }
         }
 
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.onclick = () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                tab.classList.add('active');
-                currentMode = tab.dataset.mode;
-                document.getElementById('prompt-section').classList.remove('hidden');
-                document.getElementById('prompt-text-group').classList.toggle('hidden', currentMode === 'cross_lingual');
-                document.getElementById('instruct-section').classList.toggle('hidden', currentMode !== 'instruct');
-            };
-        });
+        function onVoiceSelect() {
+            selectedVoiceId = document.getElementById('voice-select').value;
+            document.getElementById('upload-section').classList.toggle('hidden', !!selectedVoiceId);
+        }
+
+        async function deleteSelectedVoice() {
+            if (!selectedVoiceId) return alert('请先选择要删除的音色');
+            if (!confirm('确定删除此音色？')) return;
+            await fetch(`/v1/voices/${selectedVoiceId}`, { method: 'DELETE' });
+            selectedVoiceId = null; refreshVoices();
+        }
 
         const uploadArea = document.getElementById('upload-area');
         const fileInput = document.getElementById('prompt-file');
         uploadArea.onclick = () => fileInput.click();
+        fileInput.onchange = e => { promptFile = e.target.files[0]; document.getElementById('file-name').textContent = promptFile ? `📎 ${promptFile.name}` : ''; };
         uploadArea.ondragover = e => { e.preventDefault(); uploadArea.classList.add('dragover'); };
         uploadArea.ondragleave = () => uploadArea.classList.remove('dragover');
-        uploadArea.ondrop = e => { e.preventDefault(); uploadArea.classList.remove('dragover'); handleFile(e.dataTransfer.files[0]); };
-        fileInput.onchange = e => handleFile(e.target.files[0]);
-        function handleFile(file) { if (file) { promptFile = file; document.getElementById('file-name').textContent = file.name; } }
-
-        // Web Audio API streaming player
-        const SAMPLE_RATE = 24000;
-        const MIN_BUFFER_SIZE = 12000;  // 500ms buffer at 24kHz
-        const FADE_SAMPLES = 1024;
-        let audioContext = null;
-        let activeSources = [];
-        let nextPlayTime = 0;
-        
-        function stopAllAudio() {
-            activeSources.forEach(s => { try { s.stop(); } catch(e) {} });
-            activeSources = [];
-        }
-        
-        function applyFadeIn(arr) {
-            const len = Math.min(FADE_SAMPLES, arr.length);
-            for (let i = 0; i < len; i++) arr[i] *= i / len;
-        }
-        
-        function createWavBlob(pcmData, sampleRate) {
-            const numChannels = 1, bitsPerSample = 16;
-            const byteRate = sampleRate * numChannels * bitsPerSample / 8;
-            const blockAlign = numChannels * bitsPerSample / 8;
-            const dataSize = pcmData.length;
-            const buffer = new ArrayBuffer(44 + dataSize);
-            const view = new DataView(buffer);
-            
-            const writeString = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
-            writeString(0, 'RIFF');
-            view.setUint32(4, 36 + dataSize, true);
-            writeString(8, 'WAVE');
-            writeString(12, 'fmt ');
-            view.setUint32(16, 16, true);
-            view.setUint16(20, 1, true);
-            view.setUint16(22, numChannels, true);
-            view.setUint32(24, sampleRate, true);
-            view.setUint32(28, byteRate, true);
-            view.setUint16(32, blockAlign, true);
-            view.setUint16(34, bitsPerSample, true);
-            writeString(36, 'data');
-            view.setUint32(40, dataSize, true);
-            new Uint8Array(buffer, 44).set(pcmData);
-            return new Blob([buffer], { type: 'audio/wav' });
-        }
-        
-        let currentAudioBlob = null;
-        document.getElementById('download-btn').onclick = () => {
-            if (currentAudioBlob) {
-                const url = URL.createObjectURL(currentAudioBlob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `cosyvoice_${Date.now()}.wav`;
-                a.click();
-                URL.revokeObjectURL(url);
-            }
-        };
+        uploadArea.ondrop = e => { e.preventDefault(); uploadArea.classList.remove('dragover'); promptFile = e.dataTransfer.files[0]; document.getElementById('file-name').textContent = promptFile ? `📎 ${promptFile.name}` : ''; };
 
         async function generate() {
+            const text = document.getElementById('text').value.trim();
+            if (!text) return alert('请输入文本');
+            const stream = document.getElementById('stream-mode').checked;
+            const speed = parseFloat(document.getElementById('speed').value) || 1.0;
             const btn = document.getElementById('generate-btn');
-            const progress = document.getElementById('progress');
-            const audio = document.getElementById('audio-output');
-            const timer = document.getElementById('timer');
-            const downloadBtn = document.getElementById('download-btn');
-            const isStream = document.getElementById('stream-mode').checked;
-            const t = i18n[currentLang];
-            
-            btn.disabled = true;
-            progress.style.width = '10%';
-            timer.classList.remove('hidden');
-            audio.classList.add('hidden');
-            downloadBtn.classList.add('hidden');
-            stopAllAudio();
-            
-            let audioBlob = null;  // Store audio for download
-            const startTime = Date.now();
-            let timerInterval = setInterval(() => {
-                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-                timer.textContent = `⏱️ ${t.generating}... ${elapsed}s`;
-            }, 100);
+            const btnText = document.getElementById('btn-text');
+
+            btn.disabled = true; btnText.textContent = '生成中...';
+            document.getElementById('progress-container').classList.remove('hidden');
+            document.getElementById('stats-panel').classList.remove('hidden');
+            document.getElementById('audio-container').classList.remove('show');
+            document.getElementById('progress').style.width = '0%';
+            ['ttfb', 'start', 'total', 'size'].forEach(id => {
+                document.getElementById(id + '-value').textContent = '--';
+                document.getElementById('stat-' + id).classList.remove('highlight');
+            });
+
+            startTime = performance.now();
+            let totalBytes = 0, firstChunk = true, ttfbTime = 0, audioStartTime = 0;
 
             try {
-                progress.style.width = '30%';
-                let res;
-                
-                // 如果选择了已有音色，使用 OpenAI 风格 API
+                const formData = new FormData();
+                formData.append('text', text);
+                formData.append('mode', currentMode);
+                formData.append('speed', speed);
+                formData.append('stream', stream ? '1' : '0');
+
                 if (selectedVoiceId) {
-                    const body = {
-                        input: document.getElementById('text').value,
-                        voice: selectedVoiceId,
-                        response_format: isStream ? 'pcm' : 'wav',
-                        speed: parseFloat(document.getElementById('speed').value)
-                    };
-                    if (currentMode === 'instruct') {
-                        body.instruct = document.getElementById('instruct-text').value;
-                    }
-                    res = await fetch('/v1/audio/speech', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(body)
-                    });
-                } else {
-                    // 上传新音频
-                    if (!promptFile) throw new Error('请上传参考音频或选择已有音色');
-                    
-                    const formData = new FormData();
-                    formData.append('text', document.getElementById('text').value);
-                    formData.append('mode', currentMode);
-                    formData.append('speed', document.getElementById('speed').value);
-                    formData.append('stream', isStream);
-                    formData.append('prompt_wav', promptFile);
+                    formData.append('voice', selectedVoiceId);
+                } else if (promptFile) {
+                    formData.append('prompt_audio', promptFile);
                     formData.append('prompt_text', document.getElementById('prompt-text').value);
-                    if (currentMode === 'instruct') formData.append('instruct_text', document.getElementById('instruct-text').value);
-                    
-                    res = await fetch('/api/tts', { method: 'POST', body: formData });
-                    
-                    // 如果勾选了保存音色，保存它
-                    if (document.getElementById('save-voice').checked && res.ok) {
-                        const voiceName = document.getElementById('voice-name').value || promptFile.name;
-                        const saveForm = new FormData();
-                        saveForm.append('audio', promptFile);
-                        saveForm.append('name', voiceName);
-                        saveForm.append('text', document.getElementById('prompt-text').value);
-                        fetch('/v1/voices/create', { method: 'POST', body: saveForm })
-                            .then(() => refreshVoices());
-                    }
-                }
-                
-                if (!res.ok) throw new Error(await res.text());
-                
-                if (isStream) {
-                    // Initialize Web Audio API
-                    if (!audioContext) audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-                    if (audioContext.state === 'suspended') await audioContext.resume();
-                    nextPlayTime = audioContext.currentTime + 0.15;
-                    
+                    if (document.getElementById('save-voice').checked) formData.append('voice_name', document.getElementById('voice-name').value || '未命名');
+                } else { alert('请选择音色或上传参考音频'); btn.disabled = false; btnText.textContent = '🚀 生成语音'; return; }
+
+                if (currentMode === 'instruct') formData.append('instruct', document.getElementById('instruct-text').value);
+
+                if (stream) {
+                    const res = await fetch('/api/tts', { method: 'POST', body: formData });
+                    if (!res.ok) throw new Error(await res.text());
                     const reader = res.body.getReader();
-                    let pendingBytes = new Uint8Array(0);
-                    let allPcmBytes = [];  // Collect all PCM data for download
-                    let samples = [];
-                    let totalSamples = 0;
-                    let isFirstChunk = true;
-                    let firstChunkTime = null;
-                    
-                    function playBuffer() {
-                        if (samples.length === 0) return;
-                        const float32 = new Float32Array(samples);
-                        if (isFirstChunk) { applyFadeIn(float32); isFirstChunk = false; }
-                        
-                        const audioBuffer = audioContext.createBuffer(1, float32.length, SAMPLE_RATE);
-                        audioBuffer.getChannelData(0).set(float32);
-                        
-                        const source = audioContext.createBufferSource();
-                        source.buffer = audioBuffer;
-                        source.connect(audioContext.destination);
-                        activeSources.push(source);
-                        source.onended = () => { const idx = activeSources.indexOf(source); if (idx > -1) activeSources.splice(idx, 1); };
-                        
-                        if (nextPlayTime < audioContext.currentTime - 0.1) nextPlayTime = audioContext.currentTime + 0.05;
-                        source.start(nextPlayTime);
-                        nextPlayTime += audioBuffer.duration;
-                        totalSamples += samples.length;
-                        samples = [];
-                    }
-                    
+                    const chunks = [];
+                    const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                    let nextStartTime = audioCtx.currentTime, playbackStarted = false;
+
                     while (true) {
                         const { done, value } = await reader.read();
-                        if (done) { playBuffer(); break; }
-                        
-                        allPcmBytes.push(value);  // Collect for download
-                        
-                        if (!firstChunkTime) {
-                            firstChunkTime = Date.now();
-                            const ttfb = ((firstChunkTime - startTime) / 1000).toFixed(2);
-                            timer.textContent = `⏱️ ${t.firstChunk}: ${ttfb}s | ${t.generating}...`;
+                        if (done) break;
+                        if (firstChunk) {
+                            ttfbTime = performance.now() - startTime;
+                            document.getElementById('ttfb-value').textContent = (ttfbTime / 1000).toFixed(3) + 's';
+                            document.getElementById('stat-ttfb').classList.add('highlight');
+                            firstChunk = false;
                         }
-                        
-                        // Combine with pending bytes
-                        const combined = new Uint8Array(pendingBytes.length + value.length);
-                        combined.set(pendingBytes);
-                        combined.set(value, pendingBytes.length);
-                        
-                        // Ensure byte alignment (Int16 = 2 bytes)
-                        const validLength = Math.floor(combined.length / 2) * 2;
-                        const validData = combined.slice(0, validLength);
-                        pendingBytes = combined.slice(validLength);
-                        
-                        // Convert PCM to float samples
-                        const int16 = new Int16Array(validData.buffer, validData.byteOffset, validData.length / 2);
-                        for (let i = 0; i < int16.length; i++) samples.push(int16[i] / 32768);
-                        
-                        progress.style.width = `${30 + Math.min(60, samples.length / 1000)}%`;
-                        if (samples.length >= MIN_BUFFER_SIZE) playBuffer();
+                        chunks.push(value); totalBytes += value.length;
+                        document.getElementById('size-value').textContent = (totalBytes / 1024).toFixed(0) + ' KB';
+
+                        const int16 = new Int16Array(value.buffer);
+                        const float32 = new Float32Array(int16.length);
+                        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+                        const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+                        buffer.getChannelData(0).set(float32);
+                        const source = audioCtx.createBufferSource();
+                        source.buffer = buffer; source.connect(audioCtx.destination);
+                        if (nextStartTime < audioCtx.currentTime) nextStartTime = audioCtx.currentTime;
+                        source.start(nextStartTime); nextStartTime += buffer.duration;
+
+                        if (!playbackStarted) {
+                            audioStartTime = performance.now() - startTime;
+                            document.getElementById('start-value').textContent = (audioStartTime / 1000).toFixed(3) + 's';
+                            document.getElementById('stat-start').classList.add('highlight');
+                            playbackStarted = true;
+                        }
+                        document.getElementById('progress').style.width = Math.min(95, (totalBytes / (text.length * 500)) * 100) + '%';
                     }
-                    
-                    // Create WAV blob for download
-                    const totalLength = allPcmBytes.reduce((sum, arr) => sum + arr.length, 0);
-                    const pcmData = new Uint8Array(totalLength);
-                    let offset = 0;
-                    for (const chunk of allPcmBytes) { pcmData.set(chunk, offset); offset += chunk.length; }
-                    audioBlob = createWavBlob(pcmData, SAMPLE_RATE);
-                    
-                    clearInterval(timerInterval);
-                    const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
-                    const ttfb = firstChunkTime ? ((firstChunkTime - startTime) / 1000).toFixed(2) : '-';
-                    const audioDuration = (totalSamples / 24000).toFixed(2);
-                    timer.textContent = `✅ ${t.firstChunk}: ${ttfb}s | ${t.totalTime}: ${totalTime}s | ${t.audioDuration}: ${audioDuration}s`;
-                    timer.style.background = 'var(--accent)';
-                    downloadBtn.classList.remove('hidden');
-                    progress.style.width = '100%';
+
+                    const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+                    const allPcm = new Uint8Array(totalLength);
+                    let offset = 0; for (const chunk of chunks) { allPcm.set(chunk, offset); offset += chunk.length; }
+                    const wavBlob = createWav(allPcm, 24000);
+                    const url = URL.createObjectURL(wavBlob);
+                    document.getElementById('audio-output').src = url;
+                    document.getElementById('download-btn').onclick = () => { const a = document.createElement('a'); a.href = url; a.download = 'cosyvoice_' + Date.now() + '.wav'; a.click(); };
                 } else {
-                    const blob = await res.blob();
-                    audioBlob = blob;
-                    audio.src = URL.createObjectURL(blob);
-                    clearInterval(timerInterval);
-                    const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
-                    timer.textContent = `✅ ${t.totalTime}: ${totalTime}s`;
-                    timer.style.background = 'var(--accent)';
-                    audio.classList.remove('hidden');
-                    downloadBtn.classList.remove('hidden');
-                    audio.play();
-                    progress.style.width = '100%';
+                    const res = await fetch('/api/tts', { method: 'POST', body: formData });
+                    if (!res.ok) throw new Error(await res.text());
+                    ttfbTime = performance.now() - startTime;
+                    document.getElementById('ttfb-value').textContent = (ttfbTime / 1000).toFixed(3) + 's';
+                    const blob = await res.blob(); totalBytes = blob.size;
+                    document.getElementById('size-value').textContent = (totalBytes / 1024).toFixed(0) + ' KB';
+                    const url = URL.createObjectURL(blob);
+                    document.getElementById('audio-output').src = url;
+                    audioStartTime = performance.now() - startTime;
+                    document.getElementById('start-value').textContent = (audioStartTime / 1000).toFixed(3) + 's';
+                    document.getElementById('download-btn').onclick = () => { const a = document.createElement('a'); a.href = url; a.download = 'cosyvoice_' + Date.now() + '.wav'; a.click(); };
                 }
-            } catch (e) {
-                clearInterval(timerInterval);
-                timer.textContent = '❌ Error: ' + e.message;
-                timer.style.background = '#c0392b';
-            } finally {
-                currentAudioBlob = audioBlob;
-                btn.disabled = false;
-                setTimeout(() => {
-                    progress.style.width = '0%';
-                    timer.style.background = 'var(--primary)';
-                }, 2000);
-            }
+
+                const totalTime = performance.now() - startTime;
+                document.getElementById('total-value').textContent = (totalTime / 1000).toFixed(2) + 's';
+                document.getElementById('stat-total').classList.add('highlight');
+                document.getElementById('stat-size').classList.add('highlight');
+                document.getElementById('progress').style.width = '100%';
+                document.getElementById('progress-status').innerHTML = '<span style="color: var(--success);">✅ PCM 完成！</span> ' + (totalBytes / 1024).toFixed(0) + 'KB, 约' + (totalBytes / 24000 / 2).toFixed(1) + '秒';
+                document.getElementById('audio-container').classList.add('show');
+                refreshVoices();
+            } catch (e) { alert('生成失败: ' + e.message); console.error(e); }
+            finally { btn.disabled = false; btnText.textContent = '🚀 生成语音'; }
         }
 
-        async function offloadGPU() {
-            await fetch('/api/offload', { method: 'POST' });
-            updateStatus();
+        function createWav(pcmData, sampleRate) {
+            const buffer = new ArrayBuffer(44 + pcmData.length);
+            const view = new DataView(buffer);
+            const writeString = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+            writeString(0, 'RIFF'); view.setUint32(4, 36 + pcmData.length, true); writeString(8, 'WAVE'); writeString(12, 'fmt ');
+            view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+            writeString(36, 'data'); view.setUint32(40, pcmData.length, true); new Uint8Array(buffer, 44).set(pcmData);
+            return new Blob([buffer], { type: 'audio/wav' });
         }
 
+        async function offloadGPU() { await fetch('/api/offload', { method: 'POST' }); updateStatus(); }
         async function updateStatus() {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
-                const info = data.model_loaded 
-                    ? `Model: ${data.model_dir} | GPU: ${data.gpu.memory_used}`
-                    : 'Model not loaded';
-                document.getElementById('gpu-info').textContent = info;
+                document.getElementById('gpu-info').textContent = data.model_loaded ? `Model: ${data.model_dir} | GPU: ${data.gpu.memory_used}` : 'Model not loaded';
             } catch (e) {}
         }
 
-        setLang('zh-CN');
-        updateStatus();
-        refreshVoices();
-        setInterval(updateStatus, 30000);
+        updateStatus(); refreshVoices(); setInterval(updateStatus, 30000);
     </script>
 </body>
-</html>'''
+</html>
+'''
 
 if __name__ == "__main__":
     import uvicorn
