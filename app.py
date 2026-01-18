@@ -903,6 +903,8 @@ HTML_TEMPLATE = '''
                         }
                         chunks.push(value); totalBytes += value.length;
                         document.getElementById('size-value').textContent = (totalBytes / 1024).toFixed(0) + ' KB';
+                        // 实时更新总时间
+                        document.getElementById('total-value').textContent = ((performance.now() - startTime) / 1000).toFixed(2) + 's';
 
                         const int16 = new Int16Array(value.buffer);
                         const float32 = new Float32Array(int16.length);
