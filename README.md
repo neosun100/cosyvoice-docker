@@ -21,7 +21,7 @@ One Docker command to get Web UI + REST API + Voice Cloning
 
 ## 📸 Screenshot
 
-![Web UI](https://img.aws.xin/uPic/o1Qj12.png)
+![Web UI](assets/ui-screenshot.png)
 
 ## ✨ Features
 

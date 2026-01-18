@@ -625,7 +625,7 @@ HTML_TEMPLATE = '''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CosyVoice TTS</title>
+    <title>CosyVoice3 TTS</title>
     <style>
         :root {
             --bg: #0a0a0f; --card: #12121a; --card-hover: #1a1a25;
@@ -634,6 +634,12 @@ HTML_TEMPLATE = '''
             --success: #10b981; --warning: #f59e0b; --danger: #ef4444;
             --text: #f1f5f9; --text-muted: #94a3b8; --border: #1e293b;
             --gradient: linear-gradient(135deg, #6366f1, #22d3ee);
+        }
+        [data-theme="light"] {
+            --bg: #f8fafc; --card: #ffffff; --card-hover: #f1f5f9;
+            --primary: #4f46e5; --primary-glow: rgba(79,70,229,0.2);
+            --accent: #0891b2; --accent-glow: rgba(8,145,178,0.15);
+            --text: #1e293b; --text-muted: #64748b; --border: #e2e8f0;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { 
@@ -716,12 +722,13 @@ HTML_TEMPLATE = '''
         <header>
             <div class="logo">
                 <div class="logo-icon">🎙️</div>
-                <div><h1>CosyVoice</h1><span>AI Text-to-Speech</span></div>
+                <div><h1>CosyVoice3</h1><span>AI Text-to-Speech</span></div>
             </div>
             <div class="header-controls">
                 <select id="lang" onchange="setLang(this.value)"><option value="zh-CN">简体中文</option><option value="en">English</option></select>
+                <button onclick="window.open('https://github.com/neosun100/cosyvoice-docker', '_blank')" title="GitHub">⭐</button>
                 <button onclick="window.open('/docs', '_blank')" title="API 文档">📄</button>
-                <button onclick="toggleTheme()">🌓</button>
+                <button onclick="toggleTheme()" title="切换主题">🌓</button>
             </div>
         </header>
         <div class="card">
