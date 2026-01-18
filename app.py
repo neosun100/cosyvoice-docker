@@ -398,7 +398,8 @@ async def openai_speech(request: SpeechRequest):
     if custom_voice:
         # 使用自定义音色
         prompt_audio = custom_voice["audio_path"]
-        prompt_text = custom_voice["text"]
+        # 添加 <|endofprompt|> 前缀修复音频重复问题 (GitHub Issue #967, #1704)
+        prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
         
         if request.instruct:
             # instruct 模式
