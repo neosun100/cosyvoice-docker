@@ -470,6 +470,7 @@ async def tts(
 ):
     model = gpu_manager.get_model()
     prompt_audio = None
+    is_temp_file = False  # 标记是否是临时文件，只有临时文件才需要清理
     
     # 优先使用自定义音色
     custom_voice = voice_manager.get(voice) if voice else None
@@ -482,6 +483,7 @@ async def tts(
         temp_path = INPUT_DIR / f"prompt_{uuid.uuid4().hex}.wav"
         temp_path.write_bytes(content)
         prompt_audio = str(temp_path)
+        is_temp_file = True  # 上传的文件是临时文件
     
     try:
         # 参数验证
@@ -523,7 +525,7 @@ async def tts(
         
         if stream:
             return StreamingResponse(
-                generate_audio_stream(output, model.sample_rate, cleanup_path=prompt_audio),
+                generate_audio_stream(output, model.sample_rate, cleanup_path=prompt_audio if is_temp_file else None),
                 media_type="audio/pcm"
             )
         
@@ -536,15 +538,15 @@ async def tts(
         filename = f"tts_{uuid.uuid4().hex}.wav"
         output_path = save_audio(full_speech, model.sample_rate, filename)
         
-        # Cleanup temp file for non-streaming mode
-        if prompt_audio and Path(prompt_audio).exists():
+        # Cleanup temp file for non-streaming mode (only if it's a temp file)
+        if is_temp_file and prompt_audio and Path(prompt_audio).exists():
             Path(prompt_audio).unlink()
         
         return FileResponse(output_path, media_type="audio/wav", filename=filename)
     
     except Exception as e:
-        # Cleanup on error
-        if prompt_audio and Path(prompt_audio).exists():
+        # Cleanup on error (only if it's a temp file)
+        if is_temp_file and prompt_audio and Path(prompt_audio).exists():
             Path(prompt_audio).unlink()
         raise
 
