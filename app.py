@@ -458,6 +458,7 @@ async def list_speakers():
 
 @app.post("/api/tts")
 async def tts(
+    voice: str = Form(""),
     text: str = Form(...),
     mode: str = Form("zero_shot"),
     prompt_text: str = Form(""),
@@ -470,7 +471,13 @@ async def tts(
     model = gpu_manager.get_model()
     prompt_audio = None
     
-    if prompt_wav:
+    # 优先使用自定义音色
+    custom_voice = voice_manager.get(voice) if voice else None
+    if custom_voice:
+        prompt_audio = custom_voice["audio_path"]
+        # 添加 <|endofprompt|> 前缀修复音频重复问题
+        prompt_text = f'<|endofprompt|>{custom_voice["text"]}'
+    elif prompt_wav:
         content = await prompt_wav.read()
         temp_path = INPUT_DIR / f"prompt_{uuid.uuid4().hex}.wav"
         temp_path.write_bytes(content)
@@ -480,18 +487,20 @@ async def tts(
         # 参数验证
         if mode == "zero_shot":
             if not prompt_audio:
-                raise HTTPException(400, "zero_shot mode requires prompt_wav (reference audio)")
-            # 自动识别 prompt_text
-            if not prompt_text:
+                raise HTTPException(400, "zero_shot mode requires prompt_wav or voice (custom voice ID)")
+            # 自动识别 prompt_text (仅当未使用自定义音色且没有提供 prompt_text 时)
+            if not prompt_text and not custom_voice:
                 print("Auto transcribing prompt audio with Fun-ASR...")
                 prompt_text = transcribe_audio(prompt_audio)
+                # 添加前缀修复重复问题
+                prompt_text = f'<|endofprompt|>{prompt_text}'
                 print(f"Transcribed: {prompt_text}")
         elif mode == "cross_lingual":
             if not prompt_audio:
-                raise HTTPException(400, "cross_lingual mode requires prompt_wav (reference audio)")
+                raise HTTPException(400, "cross_lingual mode requires prompt_wav or voice (custom voice ID)")
         elif mode == "instruct":
             if not prompt_audio:
-                raise HTTPException(400, "instruct mode requires prompt_wav (reference audio)")
+                raise HTTPException(400, "instruct mode requires prompt_wav or voice (custom voice ID)")
             if not instruct_text:
                 raise HTTPException(400, "instruct mode requires instruct_text")
         elif mode == "sft":
